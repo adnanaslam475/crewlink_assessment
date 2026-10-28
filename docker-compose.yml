@@ -1,0 +1,100 @@
+# CrewLink — local dev stack. `docker compose up --build` works with no .env (defaults inline).
+# The load-balanced 2-instance setup lives in docker-compose.lb.yml (added after the core).
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-crewlink}
+      POSTGRES_USER: ${POSTGRES_USER:-crewlink_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-crewlink_admin_pw}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-crewlink_admin} -d ${POSTGRES_DB:-crewlink}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # No host port mapping: only backend/worker reach Postgres over the compose
+    # network (host:container 5432 would clash with a local Postgres).
+
+  redis:
+    image: redis:7
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build: ./backend
+    command: gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 3
+    environment: &backend_env
+      POSTGRES_DB: ${POSTGRES_DB:-crewlink}
+      POSTGRES_USER: ${POSTGRES_USER:-crewlink_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-crewlink_admin_pw}
+      DB_APP_USER: ${DB_APP_USER:-crewlink_app}
+      DB_APP_PASSWORD: ${DB_APP_PASSWORD:-crewlink_app_pw}
+      DB_HOST: postgres
+      DB_PORT: 5432
+      REDIS_URL: redis://redis:6379/0
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-dev-insecure-secret-change-me}
+      DJANGO_DEBUG: "1"
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      AI_TIMEOUT_SECONDS: ${AI_TIMEOUT_SECONDS:-8}
+      RUN_MIGRATIONS: "1"
+      SEED_ON_START: ${SEED_ON_START:-1}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+      # Direct API alias; the LB override gives :8080 to nginx instead.
+      - "8080:8000"
+
+  worker:
+    build: ./backend
+    command: celery -A config worker --loglevel=info --concurrency=4
+    restart: unless-stopped
+    environment:
+      <<: *backend_env
+      RUN_MIGRATIONS: "0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started
+
+  scheduler:
+    build: ./backend
+    command: celery -A config beat --loglevel=info --schedule=/tmp/crewlink-celerybeat-schedule
+    restart: unless-stopped
+    environment:
+      <<: *backend_env
+      RUN_MIGRATIONS: "0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started
+
+  frontend:
+    build: ./frontend
+    command: npm run dev
+    environment:
+      NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-http://localhost:8000}
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_started
+
+volumes:
+  pgdata:

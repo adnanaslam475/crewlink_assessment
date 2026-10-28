@@ -1,0 +1,54 @@
+# DevOps bonus: run two backend instances behind nginx (round-robin) and prove
+# Rule 2 still holds across instances.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.lb.yml up -d --build
+#
+# nginx is published on :8080. The frontend is pointed at it, so the whole app
+# goes through the load balancer.
+
+services:
+  # Replace the base ports: nginx owns :8080 in load-balancer mode.
+  backend:
+    ports: !override
+      - "8000:8000"
+
+  backend2:
+    build: ./backend
+    command: gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 3
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-crewlink}
+      POSTGRES_USER: ${POSTGRES_USER:-crewlink_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-crewlink_admin_pw}
+      DB_APP_USER: ${DB_APP_USER:-crewlink_app}
+      DB_APP_PASSWORD: ${DB_APP_PASSWORD:-crewlink_app_pw}
+      DB_HOST: postgres
+      DB_PORT: 5432
+      REDIS_URL: redis://redis:6379/0
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-dev-insecure-secret-change-me}
+      DJANGO_DEBUG: "1"
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      AI_TIMEOUT_SECONDS: ${AI_TIMEOUT_SECONDS:-8}
+      RUN_MIGRATIONS: "0"   # instance 1 (backend) owns migrations
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started
+
+  nginx:
+    image: nginx:1.27
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+      - backend2
+
+  # Point the frontend at the load balancer instead of a single instance.
+  frontend:
+    environment:
+      NEXT_PUBLIC_API_BASE: http://localhost:8080
